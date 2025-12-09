@@ -6,19 +6,14 @@
 // Initialize LCD at I2C address 0x27
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// WIRING:
-// ATmega168 (Transmitter): E5 TX -> Pin 10, E5 RX -> Pin 11
-// Nano Every (Receiver):   E5 TX -> Pin 0,  E5 RX -> Pin 1
-// Both: GND -> GND, VCC -> 3.3V
+// WIRING (same for both boards):
+// E5 TX -> Pin 10
+// E5 RX -> Pin 11
+// GND -> GND, VCC -> 3.3V or 5V
 
-// For ATmega168: Use SoftwareSerial on pins 10,11
-// For Nano Every: Use Serial1 (hardware UART on pins 0,1)
-#if defined(__AVR_ATmega168__) || defined(__AVR_ATmega328P__)
-  SoftwareSerial loraSerial(10, 11);  // RX=10, TX=11
-  #define LORA_SERIAL loraSerial
-#else
-  #define LORA_SERIAL Serial1
-#endif
+// Both boards use SoftwareSerial on pins 10,11
+SoftwareSerial loraSerial(10, 11);  // RX=10, TX=11
+#define LORA_SERIAL loraSerial
 
 // Simple buffer for responses - small for ATmega168, larger for Nano Every
 #if defined(__AVR_ATmega168__) || defined(__AVR_ATmega328P__)
@@ -72,6 +67,9 @@ bool sendAT(const char* cmd, unsigned int timeout = 1000) {
 #if defined(__AVR_ATmega168__) || defined(__AVR_ATmega328P__)
 
 int count = 0;
+unsigned long lastTxTime = 0;
+unsigned long stateStartTime = 0;
+byte txState = 0;  // 0=idle, 1=sending, 2=reading response, 3=displaying result
 
 void setup() {
   LORA_SERIAL.begin(9600);
@@ -79,79 +77,83 @@ void setup() {
   lcd.init();
   lcd.backlight();
   
-  lcdPrint(F("ATmega168"), F("TRANSMITTER"));
-  delay(2000);
+  lcdPrint(F("TRANSMITTER"), F("Starting..."));
+  delay(2000);  // Wait for LoRa-E5 to boot
   
-  lcdPrint(F("Init LoRa..."), F("Please wait"));
-  delay(2000);
-  
-  lcdPrint(F("Sending AT..."));
-  
-  if (sendAT("AT", 1500)) {
-    lcdPrint(F("Got response!"));
-    delay(1500);
-  } else {
-    lcdPrint(F("No response"), F("Check wiring"));
-    delay(2000);
-    lcdPrint(F("E5 TX->Pin10"), F("E5 RX->Pin11"));
-    while(1) { delay(1000); }
-  }
-  
-  lcdPrint(F("Set TEST mode"));
+  // Configure LoRa
   sendAT("AT+MODE=TEST", 1500);
-  delay(1000);
+  sendAT("AT+TEST=RFCFG,915,SF12,125,15,15,22,ON,OFF,OFF", 2000);
   
-  lcdPrint(F("Config RF..."));
-  // Set frequency to 915MHz
-  sendAT("AT+TEST=RFCFG,915,SF7,125,12,15,14,ON,OFF,OFF", 2000);
-  delay(1000);
-  
-  lcdPrint(F("Ready!"), F("TX every 5s"));
-  delay(1000);
+  lcdPrint(F("TX every 5s"), F("MAX RANGE"));
+  lastTxTime = millis() - 5000;  // Trigger first TX immediately
 }
 
 void loop() {
-  count++;
+  unsigned long now = millis();
   
-  char line1[17];
-  snprintf(line1, 17, "TX #%d", count);
-  displayLCD(line1, "Sending...");
-  
-  // Send test packet
-  LORA_SERIAL.print(F("AT+TEST=TXLRSTR,\"TEST"));
-  LORA_SERIAL.print(count);
-  LORA_SERIAL.println(F("\""));
-  
-  delay(2000);
-  
-  // Read response
-  byte idx = 0;
-  unsigned long start = millis();
-  while (millis() - start < 2000 && idx < 31) {
-    if (LORA_SERIAL.available()) {
-      respBuf[idx++] = LORA_SERIAL.read();
-    }
+  switch (txState) {
+    case 0:  // Idle - wait for next TX time
+      if (now - lastTxTime >= 5000) {
+        lastTxTime = now;  // Reset timer at START of transmission
+        count++;
+        char line1[17];
+        snprintf(line1, 17, "TX #%d", count);
+        displayLCD(line1, "Sending...");
+        
+        // Send test packet
+        LORA_SERIAL.print(F("AT+TEST=TXLRSTR,\"TEST"));
+        LORA_SERIAL.print(count);
+        LORA_SERIAL.println(F("\""));
+        
+        stateStartTime = now;
+        txState = 1;
+      }
+      break;
+      
+    case 1:  // Wait for TX to complete
+      if (now - stateStartTime >= 2000) {
+        // Read any response
+        byte idx = 0;
+        while (LORA_SERIAL.available() && idx < 31) {
+          respBuf[idx++] = LORA_SERIAL.read();
+        }
+        respBuf[idx] = '\0';
+        
+        char line1[17];
+        snprintf(line1, 17, "TX #%d", count);
+        if (strstr(respBuf, "DONE")) {
+          displayLCD(line1, "TX OK!");
+        } else {
+          displayLCD(line1, "TX sent");
+        }
+        
+        stateStartTime = now;
+        txState = 2;
+      }
+      break;
+      
+    case 2:  // Display result briefly
+      if (now - stateStartTime >= 1000) {
+        txState = 0;
+      }
+      break;
   }
-  respBuf[idx] = '\0';
-  
-  if (strstr(respBuf, "DONE")) {
-    displayLCD(line1, "TX OK!");
-  } else {
-    displayLCD(line1, "TX sent");
-  }
-  
-  delay(3000);
 }
 
 // ============ RECEIVER CODE (Nano Every) ============
 #else
 
-// Nano Every uses Serial1 (hardware UART on pins 0,1)
+// Nano Every (Receiver)
 // Same wiring as transmitter:
-// E5 TX -> Pin 0
-// E5 RX -> Pin 1
+// E5 TX -> Pin 10
+// E5 RX -> Pin 11
 
 int rxCount = 0;
+unsigned long lastRxTime = 0;
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastCharTime = 0;
+byte respIdx = 0;
+bool receiving = false;
 
 void setup() {
   Serial.begin(9600);
@@ -160,92 +162,71 @@ void setup() {
   lcd.init();
   lcd.backlight();
   
-  displayLCD("Nano Every", "RECEIVER");
-  Serial.println("=== NANO EVERY RECEIVER ===");
-  Serial.println("Wiring: E5 TX->Pin0, E5 RX->Pin1");
-  delay(2000);
+  displayLCD("RECEIVER", "Starting...");
+  delay(2000);  // Wait for LoRa-E5 to boot
   
-  displayLCD("Init LoRa...");
-  Serial.println("Waiting for LoRa-E5 to boot...");
-  delay(3000);
-  
-  // Clear buffer
+  // Clear buffer and configure LoRa
   while (LORA_SERIAL.available()) LORA_SERIAL.read();
+  sendAT("AT+MODE=TEST", 1500);
+  sendAT("AT+TEST=RFCFG,915,SF12,125,15,15,22,ON,OFF,OFF", 2000);
   
-  // Test AT
-  displayLCD("Testing AT...");
-  if (sendAT("AT", 2000)) {
-    Serial.print("AT Response: ");
-    Serial.println(respBuf);
-    displayLCD("AT OK!");
-    delay(1000);
-  } else {
-    displayLCD("AT Failed!", "Check wiring");
-    Serial.println("No response - check wiring!");
-    delay(3000);
-  }
-  
-  // Set test mode
-  displayLCD("Set TEST mode");
-  Serial.println("Setting TEST mode...");
-  sendAT("AT+MODE=TEST", 2000);
-  Serial.print("MODE response: ");
-  Serial.println(respBuf);
-  delay(1000);
-  
-  // Configure RF - MUST MATCH TRANSMITTER!
-  displayLCD("Config RF...");
-  Serial.println("Configuring RF (915MHz, SF7, 125kHz)...");
-  // Set frequency to 915MHz
-  sendAT("AT+TEST=RFCFG,915,SF7,125,12,15,14,ON,OFF,OFF", 2000);
-  Serial.print("RFCFG response: ");
-  Serial.println(respBuf);
-  delay(1000);
-  
-  // Start continuous RX mode
-  displayLCD("Start RX...");
-  Serial.println("Starting RX mode...");
-  LORA_SERIAL.println("AT+TEST=RXLRPKT");
-  delay(500);
+  // Start RX mode
+  LORA_SERIAL.println(F("AT+TEST=RXLRPKT"));
   
   displayLCD("Waiting for", "messages...");
-  Serial.println("\n=== LISTENING FOR PACKETS ===");
-  Serial.println("Make sure transmitter is running!");
+  Serial.println(F("\n=== LISTENING FOR PACKETS ==="));
 }
 
 void loop() {
-  if (LORA_SERIAL.available()) {
-    byte idx = 0;
-    unsigned long start = millis();
-    
-    while (millis() - start < 500 && idx < 80) {
-      if (LORA_SERIAL.available()) {
-        char c = LORA_SERIAL.read();
-        if (idx < 79) respBuf[idx++] = c;
-        start = millis();
-      }
+  unsigned long now = millis();
+  
+  // Non-blocking serial read - collect chars as they arrive
+  while (LORA_SERIAL.available()) {
+    char c = LORA_SERIAL.read();
+    if (respIdx < 79) {
+      respBuf[respIdx++] = c;
     }
-    respBuf[idx] = '\0';
+    lastCharTime = now;
+    receiving = true;
+  }
+  
+  // If we were receiving and 100ms passed with no new chars, process the message
+  if (receiving && (now - lastCharTime >= 100)) {
+    respBuf[respIdx] = '\0';
+    receiving = false;
     
     // Show everything received
-    if (idx > 0) {
-      Serial.print("RX: ");
+    if (respIdx > 0) {
+      Serial.print(F("RX: "));
       Serial.println(respBuf);
     }
     
     // Check for received LoRa packet
     if (strstr(respBuf, "RX \"") || strstr(respBuf, "RSSI")) {
       rxCount++;
+      lastRxTime = now;
       char line1[17];
       snprintf(line1, 17, "RX #%d", rxCount);
-      displayLCD(line1, "Got packet!");
-      Serial.print("*** PACKET ");
+      displayLCD(line1, "Time: 0.0s");
+      Serial.print(F("*** PACKET "));
       Serial.print(rxCount);
-      Serial.println(" ***");
+      Serial.println(F(" ***"));
       
-      // Re-enter RX mode after receiving
-      LORA_SERIAL.println("AT+TEST=RXLRPKT");
+      // Re-enter RX mode
+      LORA_SERIAL.println(F("AT+TEST=RXLRPKT"));
     }
+    
+    respIdx = 0;  // Reset for next message
+  }
+  
+  // Update time display every 100ms (non-blocking)
+  if (lastRxTime > 0 && !receiving && (now - lastDisplayUpdate >= 100)) {
+    lastDisplayUpdate = now;
+    unsigned long elapsed = (now - lastRxTime) / 100;
+    char line1[17], line2[17];
+    snprintf(line1, 17, "RX #%d", rxCount);
+    snprintf(line2, 17, "Time: %lu.%lus", elapsed / 10, elapsed % 10);
+    displayLCD(line1, line2);
   }
 }
 
