@@ -1,25 +1,25 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <LiquidCrystal_I2C.h>
-#include <SoftwareSerial.h>
+#include <SSD1306Ascii.h>
+#include <SSD1306AsciiWire.h>
 
-// Initialize LCD at I2C address 0x27
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+// Initialize OLED at I2C address 0x3C
+#define OLED_ADDR 0x3C
+SSD1306AsciiWire oled;
 
-// WIRING (same for both boards):
-// E5 TX -> Pin 10
-// E5 RX -> Pin 11
-// GND -> GND, VCC -> 3.3V or 5V
-
-// Both boards use SoftwareSerial on pins 10,11
-SoftwareSerial loraSerial(10, 11);  // RX=10, TX=11
-#define LORA_SERIAL loraSerial
-
-// Buffer size depends on chip RAM
+// Buffer size and serial config depends on chip
 #if defined(__AVR_ATmega168__) || defined(__AVR_ATmega328P__)
+  // ATmega168/328: Use SoftwareSerial on pins 10,11
+  // WIRING: E5 TX -> Pin 10, E5 RX -> Pin 11
+  #include <SoftwareSerial.h>
+  SoftwareSerial loraSerial(10, 11);  // RX=10, TX=11
+  #define LORA_SERIAL loraSerial
   char respBuf[32];
   #define DEVICE_NAME "DEV-A"
 #else
+  // Nano Every (ATmega4809): Use hardware Serial1 on pins 0,1
+  // WIRING: E5 TX -> Pin 0 (RX), E5 RX -> Pin 1 (TX)
+  #define LORA_SERIAL Serial1
   char respBuf[64];
   #define DEVICE_NAME "DEV-B"
 #endif
@@ -37,25 +37,24 @@ int lastRssi = -120;  // Last received signal strength
 byte respIdx = 0;
 bool receiving = false;
 
-// Pad string to 16 chars to overwrite old content
+// Display text on OLED row (row 0-3 for 128x64 with 2X font)
 void displayLine(byte row, const char* text) {
-  lcd.setCursor(0, row);
-  lcd.print(text);
-  // Pad with spaces to clear rest of line
-  for (byte i = strlen(text); i < 16; i++) {
-    lcd.print(' ');
-  }
+  oled.setCursor(0, row * 2);  // 2X font uses 2 rows per line
+  oled.print(text);
+  oled.clearToEOL();  // Clear rest of line
 }
 
 void setup() {
-  LORA_SERIAL.begin(9600);
-  
-  lcd.init();
-  lcd.backlight();
-  lcd.clear();
+  Wire.begin();
+  oled.begin(&Adafruit128x64, OLED_ADDR);
+  oled.setFont(Adafruit5x7);
+  oled.set2X();  // Double size for readability
+  oled.clear();
   
   displayLine(0, DEVICE_NAME);
-  displayLine(1, "Starting...");
+  displayLine(1, "Init LoRa...");
+  
+  LORA_SERIAL.begin(9600);
   delay(2000);  // Wait for LoRa-E5 to boot
   
   // Clear buffer and configure LoRa
@@ -63,8 +62,22 @@ void setup() {
   
   // Set TEST mode
   LORA_SERIAL.println(F("AT+MODE=TEST"));
-  delay(500);
-  while (LORA_SERIAL.available()) LORA_SERIAL.read();
+  delay(1000);
+  
+  // Read response to check if LoRa is responding
+  byte cnt = 0;
+  while (LORA_SERIAL.available() && cnt < sizeof(respBuf)-1) {
+    respBuf[cnt++] = LORA_SERIAL.read();
+  }
+  respBuf[cnt] = '\0';
+  
+  // Show response on display (truncated)
+  if (cnt > 0) {
+    displayLine(1, "LoRa OK");
+  } else {
+    displayLine(1, "No response!");
+  }
+  delay(1000);
   
   // Configure RF - max range
   LORA_SERIAL.println(F("AT+TEST=RFCFG,915,SF12,125,15,15,22,ON,OFF,OFF"));
@@ -76,6 +89,8 @@ void setup() {
   delay(100);
   lastTxTime = millis();
   state = 0;
+  
+  displayLine(1, "Ready");
 }
 
 void loop() {
@@ -154,8 +169,9 @@ void loop() {
       break;
   }
   
-  // Update display every 100ms (non-blocking)
-  if (now - lastDisplayUpdate >= 100) {
+  // Update display every 500ms (less frequent to avoid I2C/SoftwareSerial conflict)
+  // Only update when not actively receiving serial data
+  if (!receiving && (now - lastDisplayUpdate >= 500)) {
     lastDisplayUpdate = now;
     
     char line[17];
