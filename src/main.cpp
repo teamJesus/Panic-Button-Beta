@@ -1,72 +1,105 @@
 #include <Arduino.h>
+#include <EEPROM.h>
 #include <Wire.h>
 #include <SSD1306Ascii.h>
 #include <SSD1306AsciiWire.h>
 
-// Initialize OLED at I2C address 0x3C
 #define OLED_ADDR 0x3C
 SSD1306AsciiWire oled;
 
-// Buffer size and serial config depends on chip
 #if defined(__AVR_ATmega168__) || defined(__AVR_ATmega328P__)
-  // ATmega168/328: Use SoftwareSerial on pins 10,11
-  // WIRING: E5 TX -> Pin 10, E5 RX -> Pin 11
   #include <SoftwareSerial.h>
   SoftwareSerial loraSerial(10, 11);  // RX=10, TX=11
   #define LORA_SERIAL loraSerial
-  char respBuf[96];
-  #define DEVICE_NAME "DEV-A"
-  const unsigned long DISPLAY_INTERVAL_MS = 500;
-  const bool DEBUG_SERIAL = true;
+  char respBuf[48];
+  const unsigned long DISPLAY_INTERVAL_MS = 150;
   const unsigned long RX_SILENCE_MS = 200;
-#else
-  // Nano Every (ATmega4809): Use hardware Serial1 on pins 0,1
-  // WIRING: E5 TX -> Pin 0 (RX), E5 RX -> Pin 1 (TX)
-  #define LORA_SERIAL Serial1
-  char respBuf[64];
-  #define DEVICE_NAME "DEV-B"
-  const unsigned long DISPLAY_INTERVAL_MS = 100;
   const bool DEBUG_SERIAL = false;
+  const bool ENABLE_LORA = true;
+#else
+  #define LORA_SERIAL Serial1
+  char respBuf[128];
+  const unsigned long DISPLAY_INTERVAL_MS = 75;
   const unsigned long RX_SILENCE_MS = 100;
+  const bool DEBUG_SERIAL = false;
+  const bool ENABLE_LORA = true;
 #endif
 
-// State machine
-byte state = 0;  // 0=RX mode, 1=TX sending, 2=TX done, 3=back to RX
-unsigned long stateStartTime = 0;
-unsigned long lastTxTime = 0;
+
 unsigned long lastRxTime = 0;
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastCharTime = 0;
-int txCount = 0;
+unsigned long txStartAt = 0;
+bool txInProgress = false;
+const unsigned long TX_DONE_TIMEOUT_MS = 1500;
 int rxCount = 0;
-int lastRssi = -120;  // Last received signal strength
+int lastRssi = -120;
 byte respIdx = 0;
 bool receiving = false;
 char lastSender[17] = "Waiting";
-unsigned long buttonMsgUntil = 0;
+char rxDisplayName[17] = "";
+unsigned long rxDisplayUntil = 0;
 
-const byte BUTTON_PIN = 5;  // D5
+const byte BUTTON_PINS[] = {2, 3, 4, 5};
+const byte BUTTON_COUNT = sizeof(BUTTON_PINS) / sizeof(BUTTON_PINS[0]);
+const byte BTN1_IDX = 0;  // D2
+const byte BTN2_IDX = 1;  // D3
+const byte BTN3_IDX = 2;  // D4
+const byte BTN4_IDX = 3;  // D5
 const unsigned long DEBOUNCE_MS = 5;
 const unsigned long MIN_PRESS_MS = 5;
-bool buttonState = HIGH;  // INPUT_PULLUP idle
-bool lastButtonReading = HIGH;
-unsigned long lastButtonChangeAt = 0;
-unsigned long lowStartAt = 0;
-bool seenLow = false;
-bool txRequested = false;
-volatile bool buttonIsrFired = false;
-unsigned long lastIsrAt = 0;
+const unsigned long LONG_PRESS_MS = 2000;
+bool buttonState[BUTTON_COUNT] = {HIGH, HIGH, HIGH, HIGH};
+bool lastButtonReading[BUTTON_COUNT] = {HIGH, HIGH, HIGH, HIGH};
+unsigned long lastButtonChangeAt[BUTTON_COUNT] = {0, 0, 0, 0};
+unsigned long lowStartAt[BUTTON_COUNT] = {0, 0, 0, 0};
+bool seenLow[BUTTON_COUNT] = {false, false, false, false};
+bool buttonShort[BUTTON_COUNT] = {false, false, false, false};
+bool buttonLong[BUTTON_COUNT] = {false, false, false, false};
+bool longPressFired[BUTTON_COUNT] = {false, false, false, false};
 
-// Display text on OLED row (row 0-3 for 128x64 with 2X font)
+const byte NAME_MAX_LEN = 16;
+const int NAME_EEPROM_ADDR = 0;
+char userName[NAME_MAX_LEN + 1] = "add name";
+char editName[NAME_MAX_LEN + 1] = "add name";
+byte cursorIndex = 0;
+const char kNameChars[] = "abcdefghijklmnopqrstuvwxyz ";
+const unsigned long CURSOR_BLINK_MS = 300;
+
+char prevLine0[17] = "";
+char prevLine1[17] = "";
+char prevLine2[17] = "";
+char prevLine3[17] = "";
+
+enum ScreenMode {
+  MODE_MAIN = 0,
+  MODE_NAMING = 1
+};
+ScreenMode screenMode = MODE_MAIN;
+
 void displayLine(byte row, const char* text) {
-  oled.setCursor(0, row * 2);  // 2X font uses 2 rows per line
+  oled.setCursor(0, row * 2);
   oled.print(text);
-  oled.clearToEOL();  // Clear rest of line
+  oled.clearToEOL();
+}
+
+void updateLineIfChanged(byte row, const char* text, char* prev) {
+  if (strncmp(prev, text, 16) != 0) {
+    displayLine(row, text);
+    strncpy(prev, text, 16);
+    prev[16] = '\0';
+  }
 }
 
 void setLastSender(const char* name) {
   strncpy(lastSender, name, sizeof(lastSender) - 1);
   lastSender[sizeof(lastSender) - 1] = '\0';
+}
+
+void setRxDisplayName(const char* name, unsigned long now) {
+  strncpy(rxDisplayName, name, sizeof(rxDisplayName) - 1);
+  rxDisplayName[sizeof(rxDisplayName) - 1] = '\0';
+  rxDisplayUntil = now + 1000;
 }
 
 bool isHexChar(char c) {
@@ -125,122 +158,236 @@ void updateSenderFromPayload(const char* payload) {
   lastSender[len] = '\0';
 }
 
-void setup() {
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-#if !defined(__AVR_ATmega168__) && !defined(__AVR_ATmega328P__)
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), []() { buttonIsrFired = true; }, FALLING);
-#endif
-#if defined(__AVR_ATmega168__) || defined(__AVR_ATmega328P__)
+void sendNamePacket(const char* name) {
+  char payload[NAME_MAX_LEN + 1];
+  strncpy(payload, name, NAME_MAX_LEN);
+  payload[NAME_MAX_LEN] = '\0';
+
+  char cmd[40 + NAME_MAX_LEN];
+  snprintf(cmd, sizeof(cmd), "AT+TEST=TXLRSTR,\"%s\"", payload);
+  LORA_SERIAL.println(cmd);
   if (DEBUG_SERIAL) {
-    Serial.begin(9600);
-    Serial.println(F("DEV-A debug enabled"));
+    Serial.print(F("TX CMD: "));
+    Serial.println(cmd);
   }
-#endif
+}
+
+void loadUserName() {
+  byte first = EEPROM.read(NAME_EEPROM_ADDR);
+  if (first == 0xFF || first == 0x00) {
+    strncpy(userName, "add name", sizeof(userName) - 1);
+    userName[sizeof(userName) - 1] = '\0';
+    return;
+  }
+
+  for (byte i = 0; i < NAME_MAX_LEN; i++) {
+    char c = (char)EEPROM.read(NAME_EEPROM_ADDR + i);
+    if (c == '\0' || c == 0xFF) {
+      userName[i] = '\0';
+      break;
+    }
+    userName[i] = c;
+    if (i == NAME_MAX_LEN - 1) {
+      userName[NAME_MAX_LEN] = '\0';
+    }
+  }
+
+  if (userName[0] == '\0') {
+    strncpy(userName, "add name", sizeof(userName) - 1);
+    userName[sizeof(userName) - 1] = '\0';
+  }
+
+  bool hasValid = false;
+  for (byte i = 0; i < NAME_MAX_LEN; i++) {
+    char c = userName[i];
+    if (c == '\0') {
+      break;
+    }
+    bool ok = (c >= 'a' && c <= 'z') || c == ' ';
+    if (!ok) {
+      userName[i] = ' ';
+    } else if (c != ' ') {
+      hasValid = true;
+    }
+  }
+
+  if (!hasValid) {
+    strncpy(userName, "add name", sizeof(userName) - 1);
+    userName[sizeof(userName) - 1] = '\0';
+  }
+}
+
+void saveUserName(const char* name) {
+  char trimmed[NAME_MAX_LEN + 1];
+  strncpy(trimmed, name, NAME_MAX_LEN);
+  trimmed[NAME_MAX_LEN] = '\0';
+
+  int end = NAME_MAX_LEN - 1;
+  while (end >= 0 && trimmed[end] == ' ') {
+    trimmed[end] = '\0';
+    end--;
+  }
+
+  if (trimmed[0] == '\0') {
+    strncpy(trimmed, "add name", sizeof(trimmed) - 1);
+    trimmed[sizeof(trimmed) - 1] = '\0';
+  }
+
+  for (byte i = 0; i < NAME_MAX_LEN; i++) {
+    char c = trimmed[i];
+    if (c == '\0') {
+      EEPROM.update(NAME_EEPROM_ADDR + i, 0);
+      break;
+    }
+    EEPROM.update(NAME_EEPROM_ADDR + i, c);
+  }
+
+  strncpy(userName, trimmed, sizeof(userName) - 1);
+  userName[sizeof(userName) - 1] = '\0';
+}
+
+char nextNameChar(char current, int direction) {
+  const int count = (int)(sizeof(kNameChars) - 1);
+  int index = 0;
+  for (int i = 0; i < count; i++) {
+    if (kNameChars[i] == current) {
+      index = i;
+      break;
+    }
+  }
+  index = (index + direction + count) % count;
+  return kNameChars[index];
+}
+
+void enterNamingMode() {
+  screenMode = MODE_NAMING;
+  oled.clear();
+  strncpy(editName, userName, NAME_MAX_LEN);
+  editName[NAME_MAX_LEN] = '\0';
+  size_t len = strlen(editName);
+  for (size_t i = len; i < NAME_MAX_LEN; i++) {
+    editName[i] = ' ';
+  }
+  editName[NAME_MAX_LEN] = '\0';
+  cursorIndex = 0;
+}
+
+void leaveNamingMode(bool save) {
+  if (save) {
+    saveUserName(editName);
+  }
+  screenMode = MODE_MAIN;
+  oled.clear();
+}
+
+void setup() {
+  for (byte i = 0; i < BUTTON_COUNT; i++) {
+    pinMode(BUTTON_PINS[i], INPUT_PULLUP);
+  }
+
+  Serial.begin(9600);
+  Serial.println(F("Button test: D2=btn1 D3=btn2 D4=btn3 D5=btn4"));
+
   Wire.begin();
   oled.begin(&Adafruit128x64, OLED_ADDR);
   oled.setFont(Adafruit5x7);
-  oled.set2X();  // Double size for readability
+  oled.set2X();
   oled.clear();
-  
-  displayLine(0, DEVICE_NAME);
-  displayLine(1, "Init LoRa...");
-  
-  LORA_SERIAL.begin(9600);
+
+  loadUserName();
+  displayLine(0, userName);
+  displayLine(1, "");
+  displayLine(2, "");
+  displayLine(3, "");
+  strncpy(prevLine0, userName, 16);
+  prevLine0[16] = '\0';
+  prevLine1[0] = '\0';
+  prevLine2[0] = '\0';
+  prevLine3[0] = '\0';
+
+  if (ENABLE_LORA) {
+    LORA_SERIAL.begin(9600);
 #if defined(__AVR_ATmega168__) || defined(__AVR_ATmega328P__)
-  loraSerial.listen();
+    loraSerial.listen();
 #endif
-  delay(2000);  // Wait for LoRa-E5 to boot
-  
-  // Clear buffer and configure LoRa
-  while (LORA_SERIAL.available()) LORA_SERIAL.read();
-  
-  // Set TEST mode
-  LORA_SERIAL.println(F("AT+MODE=TEST"));
-  delay(1000);
-  
-  // Read response to check if LoRa is responding
-  byte cnt = 0;
-  while (LORA_SERIAL.available() && cnt < sizeof(respBuf)-1) {
-    respBuf[cnt++] = LORA_SERIAL.read();
+    delay(2000);
+
+    while (LORA_SERIAL.available()) LORA_SERIAL.read();
+
+    LORA_SERIAL.println(F("AT+MODE=TEST"));
+    delay(1000);
+
+    LORA_SERIAL.println(F("AT+TEST=RFCFG,915,SF12,125,15,15,22,ON,OFF,OFF"));
+    delay(500);
+    while (LORA_SERIAL.available()) LORA_SERIAL.read();
+
+    LORA_SERIAL.println(F("AT+TEST=RXLRPKT"));
+    delay(100);
   }
-  respBuf[cnt] = '\0';
-  
-  // Show response on display (truncated)
-  if (cnt > 0) {
-    displayLine(1, "LoRa OK");
-  } else {
-    displayLine(1, "No response!");
-  }
-  delay(1000);
-  
-  // Configure RF - max range
-  LORA_SERIAL.println(F("AT+TEST=RFCFG,915,SF12,125,15,15,22,ON,OFF,OFF"));
-  delay(500);
-  while (LORA_SERIAL.available()) LORA_SERIAL.read();
-  
-  // Start in RX mode
-  LORA_SERIAL.println(F("AT+TEST=RXLRPKT"));
-  delay(100);
-  lastTxTime = millis();
-  lastRxTime = lastTxTime;
-  state = 0;
-  
-  displayLine(1, "Ready");
-  displayLine(2, "TX from:");
+  lastRxTime = millis();
+
   setLastSender("Waiting");
-  displayLine(3, lastSender);
 }
 
 void loop() {
   unsigned long now = millis();
 
-#if !defined(__AVR_ATmega168__) && !defined(__AVR_ATmega328P__)
-  if (buttonIsrFired) {
-    buttonIsrFired = false;
-    if (now - lastIsrAt >= 20) {
-      lastIsrAt = now;
-      txRequested = true;
-      buttonMsgUntil = now + 1000;
+  for (byte i = 0; i < BUTTON_COUNT; i++) {
+    bool reading = digitalRead(BUTTON_PINS[i]);
+    if (reading != lastButtonReading[i]) {
+      lastButtonChangeAt[i] = now;
+      lastButtonReading[i] = reading;
     }
-  }
-#else
-  // Debounced button read (active low)
-  bool reading = digitalRead(BUTTON_PIN);
-  if (reading != lastButtonReading) {
-    lastButtonChangeAt = now;
-    lastButtonReading = reading;
-  }
-  if (now - lastButtonChangeAt >= DEBOUNCE_MS) {
-    if (reading != buttonState) {
-      buttonState = reading;
-      if (buttonState == LOW) {
-        seenLow = true;
-        lowStartAt = now;
-      } else {
-        if (seenLow && (now - lowStartAt >= MIN_PRESS_MS)) {
-          txRequested = true;  // Single send per press
-          buttonMsgUntil = now + 1000;
+    if (now - lastButtonChangeAt[i] >= DEBOUNCE_MS) {
+      if (reading != buttonState[i]) {
+        buttonState[i] = reading;
+        if (buttonState[i] == LOW) {
+          seenLow[i] = true;
+          lowStartAt[i] = now;
+          longPressFired[i] = false;
+        } else {
+          if (seenLow[i] && (now - lowStartAt[i] >= MIN_PRESS_MS)) {
+            if (!longPressFired[i]) {
+              buttonShort[i] = true;
+            }
+          }
+          seenLow[i] = false;
         }
-        seenLow = false;
+      }
+    }
+
+    if (buttonState[i] == LOW && seenLow[i] && !longPressFired[i]) {
+      if (now - lowStartAt[i] >= LONG_PRESS_MS) {
+        longPressFired[i] = true;
+        buttonLong[i] = true;
       }
     }
   }
-#endif
-  
-  // Collect serial data (non-blocking)
-  while (LORA_SERIAL.available()) {
-    char c = LORA_SERIAL.read();
-    if (respIdx < sizeof(respBuf) - 1) {
-      respBuf[respIdx++] = c;
+
+  for (byte i = 0; i < BUTTON_COUNT; i++) {
+    if (buttonShort[i]) {
+      Serial.print(F("SHORT Btn"));
+      Serial.println(i + 1);
     }
-    lastCharTime = now;
-    receiving = true;
+    if (buttonLong[i]) {
+      Serial.print(F("LONG Btn"));
+      Serial.println(i + 1);
+    }
   }
-  
-  // Process received data after 100ms of silence
-  if (receiving && (now - lastCharTime >= RX_SILENCE_MS)) {
-    respBuf[respIdx] = '\0';
-    receiving = false;
+
+  if (ENABLE_LORA) {
+    while (LORA_SERIAL.available()) {
+      char c = LORA_SERIAL.read();
+      if (respIdx < sizeof(respBuf) - 1) {
+        respBuf[respIdx++] = c;
+      }
+      lastCharTime = now;
+      receiving = true;
+    }
+
+    if (receiving && (now - lastCharTime >= RX_SILENCE_MS)) {
+      respBuf[respIdx] = '\0';
+      receiving = false;
 
 #if defined(__AVR_ATmega168__) || defined(__AVR_ATmega328P__)
     if (DEBUG_SERIAL) {
@@ -248,98 +395,143 @@ void loop() {
       Serial.println(respBuf);
     }
 #endif
-    
-    // Check for received LoRa packet
-    if (strstr(respBuf, "RX \"") || strstr(respBuf, "RSSI")) {
-      rxCount++;
-      lastRxTime = now;
-      
-      // Parse RSSI value (format: RSSI:-XX)
-      char* rssiPtr = strstr(respBuf, "RSSI:");
-      if (rssiPtr) {
-        lastRssi = atoi(rssiPtr + 5);  // Skip "RSSI:"
-      }
 
-      char* quoteStart = strchr(respBuf, '"');
-      if (quoteStart) {
-        char* quoteEnd = strchr(quoteStart + 1, '"');
-        if (quoteEnd && quoteEnd > quoteStart + 1) {
-          char payload[33];
-          size_t len = (size_t)(quoteEnd - (quoteStart + 1));
-          if (len > sizeof(payload) - 1) {
-            len = sizeof(payload) - 1;
-          }
-          memcpy(payload, quoteStart + 1, len);
-          payload[len] = '\0';
-          updateSenderFromPayload(payload);
+    if (DEBUG_SERIAL && respBuf[0] != '\0') {
+      Serial.print(F("RX: "));
+      Serial.println(respBuf);
+    }
+
+      if (strstr(respBuf, "RX \"") || strstr(respBuf, "RSSI")) {
+        rxCount++;
+        lastRxTime = now;
+
+        char* rssiPtr = strstr(respBuf, "RSSI:");
+        if (rssiPtr) {
+          lastRssi = atoi(rssiPtr + 5);
         }
-      }
-      
-      // Re-enter RX mode if we're in RX state
-      if (state == 0) {
-        LORA_SERIAL.println(F("AT+TEST=RXLRPKT"));
-#if defined(__AVR_ATmega168__) || defined(__AVR_ATmega328P__)
-        loraSerial.listen();
-#endif
-      }
-    }
-    
-    // Check for TX done
-    if (state == 1 && strstr(respBuf, "TX DONE")) {
-      state = 2;
-      stateStartTime = now;
-    }
-    
-    respIdx = 0;
-  }
-  
-  // State machine
-  switch (state) {
-    case 0:  // RX mode - wait for button press
-      if (txRequested && (now - lastTxTime >= 200)) {
-        lastTxTime = now;
-        txRequested = false;
-        txCount++;
-        char cmd[40];
-        snprintf(cmd, 40, "AT+TEST=TXLRSTR,\"%s-%d\"", DEVICE_NAME, txCount);
-        LORA_SERIAL.println(cmd);
 
-        stateStartTime = now;
-        state = 1;
-      }
-      break;
-      
-    case 1:  // Waiting for TX to complete
-      if (now - stateStartTime >= 3000) {
-        // Timeout - move on anyway
-        state = 2;
-        stateStartTime = now;
-      }
-      break;
-      
-    case 2:  // TX done, brief pause
-      if (now - stateStartTime >= 200) {
-        // Back to RX mode
+        char* quoteStart = strchr(respBuf, '"');
+        if (quoteStart) {
+          char* quoteEnd = strchr(quoteStart + 1, '"');
+          if (quoteEnd && quoteEnd > quoteStart + 1) {
+            char payload[33];
+            size_t len = (size_t)(quoteEnd - (quoteStart + 1));
+            if (len > sizeof(payload) - 1) {
+              len = sizeof(payload) - 1;
+            }
+            memcpy(payload, quoteStart + 1, len);
+            payload[len] = '\0';
+            updateSenderFromPayload(payload);
+            setRxDisplayName(lastSender, now);
+          }
+        }
+
         LORA_SERIAL.println(F("AT+TEST=RXLRPKT"));
 #if defined(__AVR_ATmega168__) || defined(__AVR_ATmega328P__)
         loraSerial.listen();
 #endif
-        state = 0;
       }
-      break;
+
+          if (strstr(respBuf, "TX DONE")) {
+        txInProgress = false;
+        LORA_SERIAL.println(F("AT+TEST=RXLRPKT"));
+      #if defined(__AVR_ATmega168__) || defined(__AVR_ATmega328P__)
+        loraSerial.listen();
+      #endif
+          }
+
+      respIdx = 0;
+    }
   }
-  
-  // Update display frequently, but avoid colliding with serial reads
-  if (!receiving && (now - lastDisplayUpdate >= DISPLAY_INTERVAL_MS)) {
+
+  if (now - lastDisplayUpdate >= DISPLAY_INTERVAL_MS) {
     lastDisplayUpdate = now;
 
     if (now - lastRxTime >= 2000) {
       setLastSender("Waiting");
     }
 
-    displayLine(0, DEVICE_NAME);
-    displayLine(1, (now < buttonMsgUntil) ? "Sending" : "Ready");
-    displayLine(2, "TX from:");
-    displayLine(3, lastSender);
+    if (screenMode == MODE_MAIN) {
+      char line2[17] = "";
+      if (rxDisplayUntil != 0 && now < rxDisplayUntil) {
+        snprintf(line2, sizeof(line2), "From:%s", rxDisplayName);
+      }
+      updateLineIfChanged(0, userName, prevLine0);
+      updateLineIfChanged(1, "", prevLine1);
+      updateLineIfChanged(2, line2, prevLine2);
+      updateLineIfChanged(3, "", prevLine3);
+    } else {
+      updateLineIfChanged(0, editName, prevLine0);
+      char arrowLine[NAME_MAX_LEN + 1];
+      bool blinkOn = ((now / CURSOR_BLINK_MS) % 2) == 0;
+      for (byte i = 0; i < NAME_MAX_LEN; i++) {
+        arrowLine[i] = (i == cursorIndex && blinkOn) ? '^' : ' ';
+      }
+      arrowLine[NAME_MAX_LEN] = '\0';
+      updateLineIfChanged(1, arrowLine, prevLine1);
+      updateLineIfChanged(2, "", prevLine2);
+      updateLineIfChanged(3, "", prevLine3);
+    }
   }
+
+  if (screenMode == MODE_MAIN) {
+    if (buttonShort[BTN1_IDX] && ENABLE_LORA) {
+      buttonShort[BTN1_IDX] = false;
+      if (!txInProgress) {
+        sendNamePacket(userName);
+        txStartAt = now;
+        txInProgress = true;
+      }
+    }
+    if (buttonLong[BTN4_IDX]) {
+      buttonLong[BTN4_IDX] = false;
+      enterNamingMode();
+    }
+  } else {
+    if (buttonLong[BTN4_IDX]) {
+      buttonLong[BTN4_IDX] = false;
+      leaveNamingMode(true);
+    }
+
+    if (buttonLong[BTN3_IDX]) {
+      buttonLong[BTN3_IDX] = false;
+      for (byte i = 0; i < NAME_MAX_LEN; i++) {
+        editName[i] = ' ';
+      }
+      editName[NAME_MAX_LEN] = '\0';
+      cursorIndex = 0;
+    }
+
+    if (buttonShort[BTN2_IDX]) {
+      buttonShort[BTN2_IDX] = false;
+      editName[cursorIndex] = nextNameChar(editName[cursorIndex], 1);
+    }
+    if (buttonShort[BTN1_IDX]) {
+      buttonShort[BTN1_IDX] = false;
+      editName[cursorIndex] = nextNameChar(editName[cursorIndex], -1);
+    }
+    if (buttonShort[BTN4_IDX]) {
+      buttonShort[BTN4_IDX] = false;
+      cursorIndex = (cursorIndex + 1) % NAME_MAX_LEN;
+    }
+    if (buttonShort[BTN3_IDX]) {
+      buttonShort[BTN3_IDX] = false;
+      cursorIndex = (cursorIndex + NAME_MAX_LEN - 1) % NAME_MAX_LEN;
+    }
+  }
+
+  for (byte i = 0; i < BUTTON_COUNT; i++) {
+    buttonShort[i] = false;
+    buttonLong[i] = false;
+  }
+
+  if (txInProgress && (now - txStartAt >= TX_DONE_TIMEOUT_MS)) {
+    LORA_SERIAL.println(F("AT+TEST=RXLRPKT"));
+#if defined(__AVR_ATmega168__) || defined(__AVR_ATmega328P__)
+    loraSerial.listen();
+#endif
+    txInProgress = false;
+  }
+
+  // No OLED button test output.
 }
