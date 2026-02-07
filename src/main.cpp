@@ -40,23 +40,34 @@ char lastSender[17] = "Waiting";
 char rxDisplayName[17] = "";
 unsigned long rxDisplayUntil = 0;
 
-const byte BUTTON_PINS[] = {2, 3, 4, 5};
+const byte BUTTON_PINS[] = {2, 3, 4, 5, 6};
 const byte BUTTON_COUNT = sizeof(BUTTON_PINS) / sizeof(BUTTON_PINS[0]);
 const byte BTN1_IDX = 0;  // D2
 const byte BTN2_IDX = 1;  // D3
 const byte BTN3_IDX = 2;  // D4
 const byte BTN4_IDX = 3;  // D5
+const byte BTN5_IDX = 4;  // D6
+const byte BUZZER_PIN = 7;  // D7
+const unsigned int BUZZER_HZ = 2000;
+const unsigned int PANIC_BUZZER_HZ = 4000;
+const unsigned long BUZZER_MS = 80;
 const unsigned long DEBOUNCE_MS = 5;
 const unsigned long MIN_PRESS_MS = 5;
 const unsigned long LONG_PRESS_MS = 2000;
-bool buttonState[BUTTON_COUNT] = {HIGH, HIGH, HIGH, HIGH};
-bool lastButtonReading[BUTTON_COUNT] = {HIGH, HIGH, HIGH, HIGH};
-unsigned long lastButtonChangeAt[BUTTON_COUNT] = {0, 0, 0, 0};
-unsigned long lowStartAt[BUTTON_COUNT] = {0, 0, 0, 0};
-bool seenLow[BUTTON_COUNT] = {false, false, false, false};
-bool buttonShort[BUTTON_COUNT] = {false, false, false, false};
-bool buttonLong[BUTTON_COUNT] = {false, false, false, false};
-bool longPressFired[BUTTON_COUNT] = {false, false, false, false};
+bool buttonState[BUTTON_COUNT] = {HIGH, HIGH, HIGH, HIGH, HIGH};
+bool lastButtonReading[BUTTON_COUNT] = {HIGH, HIGH, HIGH, HIGH, HIGH};
+unsigned long lastButtonChangeAt[BUTTON_COUNT] = {0, 0, 0, 0, 0};
+unsigned long lowStartAt[BUTTON_COUNT] = {0, 0, 0, 0, 0};
+bool seenLow[BUTTON_COUNT] = {false, false, false, false, false};
+bool buttonShort[BUTTON_COUNT] = {false, false, false, false, false};
+bool buttonLong[BUTTON_COUNT] = {false, false, false, false, false};
+bool longPressFired[BUTTON_COUNT] = {false, false, false, false, false};
+unsigned long buzzerUntil = 0;
+bool buzzerActive = false;
+bool panicActive = false;
+char panicSource[17] = "";
+bool panicToneOn = false;
+unsigned long panicLastToggleAt = 0;
 
 const byte NAME_MAX_LEN = 16;
 const int NAME_EEPROM_ADDR = 0;
@@ -100,6 +111,17 @@ void setRxDisplayName(const char* name, unsigned long now) {
   strncpy(rxDisplayName, name, sizeof(rxDisplayName) - 1);
   rxDisplayName[sizeof(rxDisplayName) - 1] = '\0';
   rxDisplayUntil = now + 1000;
+}
+
+void enterPanicMode(const char* sourceName, unsigned long now) {
+  panicActive = true;
+  strncpy(panicSource, sourceName, sizeof(panicSource) - 1);
+  panicSource[sizeof(panicSource) - 1] = '\0';
+  screenMode = MODE_MAIN;
+  panicToneOn = false;
+  panicLastToggleAt = now;
+  tone(BUZZER_PIN, BUZZER_HZ);
+  panicToneOn = true;
 }
 
 bool isHexChar(char c) {
@@ -164,6 +186,19 @@ void sendNamePacket(const char* name) {
   payload[NAME_MAX_LEN] = '\0';
 
   char cmd[40 + NAME_MAX_LEN];
+  snprintf(cmd, sizeof(cmd), "AT+TEST=TXLRSTR,\"%s\"", payload);
+  LORA_SERIAL.println(cmd);
+  if (DEBUG_SERIAL) {
+    Serial.print(F("TX CMD: "));
+    Serial.println(cmd);
+  }
+}
+
+void sendPanicPacket(const char* name) {
+  char payload[NAME_MAX_LEN + 8];
+  snprintf(payload, sizeof(payload), "PANIC:%s", name);
+
+  char cmd[48 + NAME_MAX_LEN];
   snprintf(cmd, sizeof(cmd), "AT+TEST=TXLRSTR,\"%s\"", payload);
   LORA_SERIAL.println(cmd);
   if (DEBUG_SERIAL) {
@@ -284,9 +319,11 @@ void setup() {
   for (byte i = 0; i < BUTTON_COUNT; i++) {
     pinMode(BUTTON_PINS[i], INPUT_PULLUP);
   }
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
 
   Serial.begin(9600);
-  Serial.println(F("Button test: D2=btn1 D3=btn2 D4=btn3 D5=btn4"));
+  Serial.println(F("Button test: D2=btn1 D3=btn2 D4=btn3 D5=btn4 D6=btn5"));
 
   Wire.begin();
   oled.begin(&Adafruit128x64, OLED_ADDR);
@@ -364,15 +401,24 @@ void loop() {
     }
   }
 
+  bool anyButtonEdge = false;
   for (byte i = 0; i < BUTTON_COUNT; i++) {
     if (buttonShort[i]) {
       Serial.print(F("SHORT Btn"));
       Serial.println(i + 1);
+      anyButtonEdge = true;
     }
     if (buttonLong[i]) {
       Serial.print(F("LONG Btn"));
       Serial.println(i + 1);
+      anyButtonEdge = true;
     }
+  }
+
+  if (anyButtonEdge && !panicActive) {
+    tone(BUZZER_PIN, BUZZER_HZ);
+    buzzerUntil = now + BUZZER_MS;
+    buzzerActive = true;
   }
 
   if (ENABLE_LORA) {
@@ -421,8 +467,20 @@ void loop() {
             }
             memcpy(payload, quoteStart + 1, len);
             payload[len] = '\0';
-            updateSenderFromPayload(payload);
-            setRxDisplayName(lastSender, now);
+            char decoded[33];
+            const char* parsed = payload;
+            if (decodeHexPayload(payload, decoded, sizeof(decoded))) {
+              parsed = decoded;
+            }
+            if (strncmp(parsed, "PANIC:", 6) == 0) {
+              const char* src = parsed + 6;
+              if (src[0] != '\0') {
+                enterPanicMode(src, now);
+              }
+            } else {
+              updateSenderFromPayload(parsed);
+              setRxDisplayName(lastSender, now);
+            }
           }
         }
 
@@ -451,7 +509,12 @@ void loop() {
       setLastSender("Waiting");
     }
 
-    if (screenMode == MODE_MAIN) {
+    if (panicActive) {
+      updateLineIfChanged(0, "PANIC", prevLine0);
+      updateLineIfChanged(1, panicSource, prevLine1);
+      updateLineIfChanged(2, "", prevLine2);
+      updateLineIfChanged(3, "PANIC", prevLine3);
+    } else if (screenMode == MODE_MAIN) {
       char line2[17] = "";
       if (rxDisplayUntil != 0 && now < rxDisplayUntil) {
         snprintf(line2, sizeof(line2), "From:%s", rxDisplayName);
@@ -474,7 +537,7 @@ void loop() {
     }
   }
 
-  if (screenMode == MODE_MAIN) {
+  if (!panicActive && screenMode == MODE_MAIN) {
     if (buttonShort[BTN1_IDX] && ENABLE_LORA) {
       buttonShort[BTN1_IDX] = false;
       if (!txInProgress) {
@@ -487,7 +550,7 @@ void loop() {
       buttonLong[BTN4_IDX] = false;
       enterNamingMode();
     }
-  } else {
+  } else if (!panicActive) {
     if (buttonLong[BTN4_IDX]) {
       buttonLong[BTN4_IDX] = false;
       leaveNamingMode(true);
@@ -520,9 +583,35 @@ void loop() {
     }
   }
 
+  if (buttonShort[BTN5_IDX] && ENABLE_LORA && !panicActive) {
+    buttonShort[BTN5_IDX] = false;
+    enterPanicMode(userName, now);
+    if (!txInProgress) {
+      sendPanicPacket(userName);
+      txStartAt = now;
+      txInProgress = true;
+    }
+  }
+
   for (byte i = 0; i < BUTTON_COUNT; i++) {
     buttonShort[i] = false;
     buttonLong[i] = false;
+  }
+
+  if (buzzerActive && now >= buzzerUntil && !panicActive) {
+    noTone(BUZZER_PIN);
+    buzzerActive = false;
+  }
+
+  if (panicActive && (now - panicLastToggleAt >= 100)) {
+    panicLastToggleAt = now;
+    if (panicToneOn) {
+      noTone(BUZZER_PIN);
+      panicToneOn = false;
+    } else {
+      tone(BUZZER_PIN, PANIC_BUZZER_HZ);
+      panicToneOn = true;
+    }
   }
 
   if (txInProgress && (now - txStartAt >= TX_DONE_TIMEOUT_MS)) {
